@@ -1,0 +1,28 @@
+[package]
+name = "camera-dewarp"
+version = "0.1.0"
+edition = "2024"
+description = "Fast GPU-accelerated lens distortion correction for DJI drone images"
+authors = ["Manuel Avitia"]
+license = "MIT"
+repository = "https://github.com/MAvitia/Camera_Dewarp"
+readme = "README.md"
+
+[dependencies]
+eframe = { version = "0.34", default-features = true }
+egui_extras = { version = "0.34", features = ["image"] }
+image = { version = "0.25", features = ["jpeg", "png"] }
+rayon = "1.10"
+regex = "1"
+rfd = "0.15"
+clap = { version = "4", features = ["derive"] }
+wgpu = "27"
+bytemuck = { version = "1", features = ["derive"] }
+crossbeam-channel = "0.5"
+pollster = "0.4"
+log = "0.4"
+env_logger = "0.11"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
