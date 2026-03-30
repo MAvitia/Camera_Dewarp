@@ -4,7 +4,6 @@ use crossbeam_channel::Sender;
 use image::codecs::jpeg::JpegEncoder;
 use image::{ImageReader, RgbImage};
 use rayon::prelude::*;
-use std::io::BufWriter;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Instant;
@@ -191,7 +190,7 @@ pub fn batch_dewarp(
             std::fs::create_dir_all(parent).ok();
         }
 
-        save_jpeg(&dewarped_data, w, h, &out_path, quality);
+        save_jpeg(&dewarped_data, w, h, &out_path, quality, img_path);
 
         // Send a thumbnail preview every 10th image or the first one
         if cur == 1 || cur % 10 == 0 {
@@ -225,12 +224,100 @@ fn load_rgb_image(path: &Path) -> Option<RgbImage> {
         .map(|img| img.into_rgb8())
 }
 
-fn save_jpeg(data: &[u8], width: u32, height: u32, path: &Path, quality: u8) {
-    let file = match std::fs::File::create(path) {
-        Ok(f) => f,
-        Err(_) => return,
+/// Extract metadata segments (EXIF, XMP, ICC profile, comments) from a source JPEG.
+/// Returns raw segment bytes including markers and length headers.
+/// Skips APP0 (JFIF) since the encoder provides its own.
+fn extract_jpeg_metadata(source: &Path) -> Vec<Vec<u8>> {
+    let data = match std::fs::read(source) {
+        Ok(d) => d,
+        Err(_) => return Vec::new(),
     };
-    let writer = BufWriter::new(file);
-    let mut encoder = JpegEncoder::new_with_quality(writer, quality);
-    let _ = encoder.encode(data, width, height, image::ExtendedColorType::Rgb8);
+    if data.len() < 4 || data[0] != 0xFF || data[1] != 0xD8 {
+        return Vec::new();
+    }
+
+    let mut segments = Vec::new();
+    let mut pos = 2;
+
+    while pos + 3 < data.len() {
+        if data[pos] != 0xFF {
+            break;
+        }
+
+        let marker = data[pos + 1];
+
+        if marker == 0xDA || marker == 0xD9 {
+            break;
+        }
+
+        if marker == 0x00 || (0xD0..=0xD7).contains(&marker) || marker == 0xFF {
+            pos += 1;
+            continue;
+        }
+
+        if pos + 3 >= data.len() {
+            break;
+        }
+        let seg_len = ((data[pos + 2] as usize) << 8) | (data[pos + 3] as usize);
+        let total_len = 2 + seg_len;
+
+        if pos + total_len > data.len() {
+            break;
+        }
+
+        // Keep APP1-APP15 (EXIF, XMP, ICC, etc.) and COM; skip APP0 (JFIF)
+        if (marker >= 0xE1 && marker <= 0xEF) || marker == 0xFE {
+            segments.push(data[pos..pos + total_len].to_vec());
+        }
+
+        pos += total_len;
+    }
+
+    segments
+}
+
+fn save_jpeg(data: &[u8], width: u32, height: u32, path: &Path, quality: u8, source: &Path) {
+    let mut jpeg_buf = Vec::new();
+    {
+        let mut encoder = JpegEncoder::new_with_quality(std::io::Cursor::new(&mut jpeg_buf), quality);
+        if encoder
+            .encode(data, width, height, image::ExtendedColorType::Rgb8)
+            .is_err()
+        {
+            return;
+        }
+    }
+
+    let metadata = extract_jpeg_metadata(source);
+    if metadata.is_empty() {
+        let _ = std::fs::write(path, &jpeg_buf);
+        return;
+    }
+
+    let meta_size: usize = metadata.iter().map(|s| s.len()).sum();
+    let mut output = Vec::with_capacity(jpeg_buf.len() + meta_size);
+
+    // SOI
+    output.extend_from_slice(&[0xFF, 0xD8]);
+
+    // Keep the encoder's APP0/JFIF if present
+    let mut skip = 2;
+    if jpeg_buf.len() > 5 && jpeg_buf[2] == 0xFF && jpeg_buf[3] == 0xE0 {
+        let seg_len = ((jpeg_buf[4] as usize) << 8) | (jpeg_buf[5] as usize);
+        let end = 2 + 2 + seg_len;
+        if end <= jpeg_buf.len() {
+            output.extend_from_slice(&jpeg_buf[2..end]);
+            skip = end;
+        }
+    }
+
+    // Inject original metadata segments (EXIF with GPS, XMP, ICC, etc.)
+    for seg in &metadata {
+        output.extend_from_slice(seg);
+    }
+
+    // Append remaining encoder data (quantization tables, Huffman tables, image data)
+    output.extend_from_slice(&jpeg_buf[skip..]);
+
+    let _ = std::fs::write(path, &output);
 }
