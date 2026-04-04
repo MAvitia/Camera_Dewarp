@@ -1,6 +1,6 @@
 use regex::Regex;
 use std::fs::File;
-use std::io::Read;
+use std::io::{BufRead, BufReader, Read, Write};
 use std::path::Path;
 
 #[derive(Debug, Clone)]
@@ -85,4 +85,63 @@ fn find_subsequence(haystack: &[u8], needle: &[u8]) -> Option<usize> {
     haystack
         .windows(needle.len())
         .position(|w| w == needle)
+}
+
+impl DjiCalibration {
+    /// Save calibration parameters to a human-readable text file.
+    pub fn save_to_file(&self, path: &Path) -> std::io::Result<()> {
+        let mut f = File::create(path)?;
+        writeln!(f, "# Camera Dewarp — Lens Calibration File")?;
+        writeln!(f, "# Extracted from DJI XMP DewarpData")?;
+        writeln!(f, "calibration_date={}", self.calibration_date)?;
+        writeln!(f, "fx={:.12}", self.fx)?;
+        writeln!(f, "fy={:.12}", self.fy)?;
+        writeln!(f, "cx={:.12}", self.cx)?;
+        writeln!(f, "cy={:.12}", self.cy)?;
+        writeln!(f, "k1={:.15}", self.k1)?;
+        writeln!(f, "k2={:.15}", self.k2)?;
+        writeln!(f, "k3={:.15}", self.k3)?;
+        writeln!(f, "p1={:.15}", self.p1)?;
+        writeln!(f, "p2={:.15}", self.p2)?;
+        Ok(())
+    }
+
+    /// Load calibration parameters from a previously saved text file.
+    pub fn load_from_file(path: &Path) -> Option<Self> {
+        let file = File::open(path).ok()?;
+        let reader = BufReader::new(file);
+
+        let mut cal = DjiCalibration {
+            fx: 0.0, fy: 0.0, cx: 0.0, cy: 0.0,
+            k1: 0.0, k2: 0.0, k3: 0.0, p1: 0.0, p2: 0.0,
+            calibration_date: String::new(),
+            dewarp_flag: 0,
+        };
+        let mut fields_found = 0u32;
+
+        for line in reader.lines().map_while(Result::ok) {
+            let line = line.trim().to_string();
+            if line.is_empty() || line.starts_with('#') {
+                continue;
+            }
+            let Some((key, val)) = line.split_once('=') else { continue };
+            let key = key.trim();
+            let val = val.trim();
+            match key {
+                "fx" => { cal.fx = val.parse().ok()?; fields_found += 1; }
+                "fy" => { cal.fy = val.parse().ok()?; fields_found += 1; }
+                "cx" => { cal.cx = val.parse().ok()?; fields_found += 1; }
+                "cy" => { cal.cy = val.parse().ok()?; fields_found += 1; }
+                "k1" => { cal.k1 = val.parse().ok()?; fields_found += 1; }
+                "k2" => { cal.k2 = val.parse().ok()?; fields_found += 1; }
+                "k3" => { cal.k3 = val.parse().ok()?; fields_found += 1; }
+                "p1" => { cal.p1 = val.parse().ok()?; fields_found += 1; }
+                "p2" => { cal.p2 = val.parse().ok()?; fields_found += 1; }
+                "calibration_date" => { cal.calibration_date = val.to_string(); }
+                _ => {}
+            }
+        }
+
+        if fields_found >= 9 { Some(cal) } else { None }
+    }
 }

@@ -48,6 +48,46 @@ pub fn build_undistort_lut(cal: &DjiCalibration, width: u32, height: u32, alpha:
     }
 }
 
+/// Build a re-distortion remap LUT: maps each output pixel (in distorted space)
+/// back to where it came from in an already-dewarped input image.
+/// Used to reverse DJI's on-device dewarping and restore barrel distortion.
+pub fn build_redistort_lut(cal: &DjiCalibration, width: u32, height: u32) -> RemapLut {
+    let (new_fx, new_fy, new_cx, new_cy) =
+        compute_new_camera_params(cal, width, height, 0.0);
+
+    let w = width as usize;
+    let h = height as usize;
+    let total = w * h;
+    let mut map_x = vec![0.0f32; total];
+    let mut map_y = vec![0.0f32; total];
+
+    map_x
+        .par_chunks_mut(w)
+        .zip(map_y.par_chunks_mut(w))
+        .enumerate()
+        .for_each(|(row, (mx_row, my_row))| {
+            for col in 0..w {
+                // Output pixel is in distorted space — normalize with original K
+                let x_d = (col as f64 - cal.cx) / cal.fx;
+                let y_d = (row as f64 - cal.cy) / cal.fy;
+
+                // Invert distortion to get undistorted normalized coords
+                let (x_u, y_u) = undistort_point(x_d, y_d, cal);
+
+                // Map to pixel coords in the undistorted (dewarped) input using new K
+                mx_row[col] = (x_u * new_fx + new_cx) as f32;
+                my_row[col] = (y_u * new_fy + new_cy) as f32;
+            }
+        });
+
+    RemapLut {
+        map_x,
+        map_y,
+        width,
+        height,
+    }
+}
+
 /// Iteratively invert the Brown-Conrady distortion model.
 /// Given distorted normalized coords (x_d, y_d), find undistorted (x, y).
 fn undistort_point(x_d: f64, y_d: f64, cal: &DjiCalibration) -> (f64, f64) {

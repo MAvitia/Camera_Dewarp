@@ -15,6 +15,8 @@ pub struct BatchSettings {
     pub alpha: f64,
     pub recursive: bool,
     pub use_gpu: bool,
+    pub reverse: Option<bool>,
+    pub external_cal: Option<DjiCalibration>,
 }
 
 #[derive(Clone)]
@@ -107,28 +109,28 @@ pub fn batch_dewarp(
         return;
     }
 
-    let cal = match calibration::read_dji_calibration(&images[0]) {
-        Some(c) => c,
-        None => {
-            send(ProgressMsg::Error(format!(
-                "No DJI DewarpData in {}",
-                images[0].file_name().unwrap_or_default().to_string_lossy()
-            )));
-            return;
-        }
+    let (cal, used_external) = match calibration::read_dji_calibration(&images[0]) {
+        Some(c) => (c, false),
+        None => match &settings.external_cal {
+            Some(ext) => (ext.clone(), true),
+            None => {
+                send(ProgressMsg::Error(format!(
+                    "No DJI DewarpData in {} — load a calibration file",
+                    images[0].file_name().unwrap_or_default().to_string_lossy()
+                )));
+                return;
+            }
+        },
     };
 
-    if cal.dewarp_flag != 0 {
-        send(ProgressMsg::Error(format!(
-            "Images already dewarped (DewarpFlag={})",
-            cal.dewarp_flag
-        )));
-        return;
-    }
+    // Auto-detect: if external cal was needed (no embedded data), images are already
+    // dewarped on-device, so default to reverse mode.
+    let reverse = settings
+        .reverse
+        .unwrap_or_else(|| if used_external { true } else { cal.dewarp_flag != 0 });
 
     send(ProgressMsg::CalibrationLoaded(cal.clone()));
 
-    // Read first image to get dimensions
     let first_img = match load_rgb_image(&images[0]) {
         Some(img) => img,
         None => {
@@ -141,7 +143,11 @@ pub fn batch_dewarp(
     };
     let (w, h) = (first_img.width(), first_img.height());
 
-    let lut = Arc::new(remap::build_undistort_lut(&cal, w, h, settings.alpha));
+    let lut = Arc::new(if reverse {
+        remap::build_redistort_lut(&cal, w, h)
+    } else {
+        remap::build_undistort_lut(&cal, w, h, settings.alpha)
+    });
 
     std::fs::create_dir_all(output).ok();
 
@@ -184,13 +190,14 @@ pub fn batch_dewarp(
         };
         let stem = rel.file_stem().unwrap_or_default().to_string_lossy();
         let ext = rel.extension().unwrap_or_default().to_string_lossy();
-        let out_name = format!("{stem}_dewarped.{ext}");
+        let suffix = if reverse { "warped" } else { "dewarped" };
+        let out_name = format!("{stem}_{suffix}.{ext}");
         let out_path = output.join(rel.parent().unwrap_or(Path::new(""))).join(&out_name);
         if let Some(parent) = out_path.parent() {
             std::fs::create_dir_all(parent).ok();
         }
 
-        save_jpeg(&dewarped_data, w, h, &out_path, quality, img_path);
+        save_jpeg(&dewarped_data, w, h, &out_path, quality, img_path, reverse);
 
         // Send a thumbnail preview every 10th image or the first one
         if cur == 1 || cur % 10 == 0 {
@@ -276,7 +283,33 @@ fn extract_jpeg_metadata(source: &Path) -> Vec<Vec<u8>> {
     segments
 }
 
-fn save_jpeg(data: &[u8], width: u32, height: u32, path: &Path, quality: u8, source: &Path) {
+/// Patch the DewarpFlag value inside the XMP APP1 metadata segment.
+/// Searches for `DewarpFlag="X"` and replaces X with the new value.
+/// Only works when old and new values have the same byte length.
+fn patch_dewarp_flag(segments: &mut [Vec<u8>], new_value: &[u8]) {
+    let needle = b"DewarpFlag=\"";
+    for seg in segments.iter_mut() {
+        if let Some(pos) = seg.windows(needle.len()).position(|w| w == needle) {
+            let val_start = pos + needle.len();
+            if let Some(val_len) = seg[val_start..].iter().position(|&b| b == b'"') {
+                if val_len == new_value.len() {
+                    seg[val_start..val_start + val_len].copy_from_slice(new_value);
+                } else if new_value.len() < val_len {
+                    // Pad with spaces if new value is shorter (keeps segment length valid)
+                    for i in 0..val_len {
+                        seg[val_start + i] = if i < new_value.len() {
+                            new_value[i]
+                        } else {
+                            b' '
+                        };
+                    }
+                }
+            }
+        }
+    }
+}
+
+fn save_jpeg(data: &[u8], width: u32, height: u32, path: &Path, quality: u8, source: &Path, reverse: bool) {
     let mut jpeg_buf = Vec::new();
     {
         let mut encoder = JpegEncoder::new_with_quality(std::io::Cursor::new(&mut jpeg_buf), quality);
@@ -288,10 +321,16 @@ fn save_jpeg(data: &[u8], width: u32, height: u32, path: &Path, quality: u8, sou
         }
     }
 
-    let metadata = extract_jpeg_metadata(source);
+    let mut metadata = extract_jpeg_metadata(source);
     if metadata.is_empty() {
         let _ = std::fs::write(path, &jpeg_buf);
         return;
+    }
+
+    if reverse {
+        patch_dewarp_flag(&mut metadata, b"0");
+    } else {
+        patch_dewarp_flag(&mut metadata, b"1");
     }
 
     let meta_size: usize = metadata.iter().map(|s| s.len()).sum();

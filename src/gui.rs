@@ -14,9 +14,12 @@ struct DewarpGui {
     use_gpu: bool,
     recursive: bool,
     dewarp_enabled: bool,
+    reverse_mode: bool,
 
     calibration: Option<DjiCalibration>,
+    cal_from_file: bool,
     image_count: usize,
+    needs_cal_file: bool,
 
     preview_original: Option<egui::TextureHandle>,
     preview_dewarped: Option<egui::TextureHandle>,
@@ -45,8 +48,11 @@ impl Default for DewarpGui {
             use_gpu: false,
             recursive: false,
             dewarp_enabled: true,
+            reverse_mode: false,
             calibration: None,
+            cal_from_file: false,
             image_count: 0,
+            needs_cal_file: false,
             preview_original: None,
             preview_dewarped: None,
             processing: false,
@@ -79,14 +85,31 @@ impl DewarpGui {
             return;
         }
 
-        self.calibration = calibration::read_dji_calibration(&images[0]);
+        let embedded = calibration::read_dji_calibration(&images[0]);
 
-        if self.calibration.is_none() {
-            self.status_msg = "No DJI DewarpData found.".into();
+        if let Some(cal) = embedded {
+            self.calibration = Some(cal);
+            self.cal_from_file = false;
+            self.needs_cal_file = false;
+        } else if self.cal_from_file && self.calibration.is_some() {
+            // Keep the previously loaded calibration file
+            self.needs_cal_file = false;
+        } else {
+            self.calibration = None;
+            self.cal_from_file = false;
+            self.needs_cal_file = true;
+            self.reverse_mode = true;
+            self.status_msg = format!(
+                "{} images — no embedded calibration. Load a calibration file to proceed.",
+                self.image_count
+            );
             return;
         }
 
-        self.status_msg = format!("{} images found", self.image_count);
+        self.reverse_mode = self.calibration.as_ref().is_some_and(|c| c.dewarp_flag != 0);
+
+        let mode_label = if self.reverse_mode { "REVERSE" } else { "Dewarp" };
+        self.status_msg = format!("{} images found  |  Mode: {mode_label}", self.image_count);
         self.generate_preview(&images[0], ctx);
     }
 
@@ -102,8 +125,12 @@ impl DewarpGui {
 
         let (orig_thumb, tw, th) = remap::make_thumbnail(rgb.as_raw(), w, h, 400);
 
-        let alpha = if self.crop_edges { 0.0 } else { 1.0 };
-        let lut = remap::build_undistort_lut(cal, tw, th, alpha);
+        let lut = if self.reverse_mode {
+            remap::build_redistort_lut(cal, tw, th)
+        } else {
+            let alpha = if self.crop_edges { 0.0 } else { 1.0 };
+            remap::build_undistort_lut(cal, tw, th, alpha)
+        };
         let dewarped_thumb = remap::cpu_remap(&orig_thumb, tw, th, &lut);
 
         self.preview_original = Some(ctx.load_texture(
@@ -124,12 +151,13 @@ impl DewarpGui {
         }
 
         let input = std::path::PathBuf::from(&self.input_folder);
+        let suffix = if self.reverse_mode { "warped" } else { "dewarped" };
         let output = if self.output_folder.is_empty() {
             let name = input.file_name().unwrap_or_default().to_string_lossy();
             input
                 .parent()
                 .unwrap_or(&input)
-                .join(format!("{name}_dewarped"))
+                .join(format!("{name}_{suffix}"))
         } else {
             std::path::PathBuf::from(&self.output_folder)
         };
@@ -138,11 +166,19 @@ impl DewarpGui {
             self.output_folder = output.to_string_lossy().to_string();
         }
 
+        let reverse = self.reverse_mode;
+        let ext_cal = if self.cal_from_file {
+            self.calibration.clone()
+        } else {
+            None
+        };
         let settings = BatchSettings {
             quality: self.quality,
             alpha: if self.crop_edges { 0.0 } else { 1.0 },
             recursive: self.recursive,
             use_gpu: self.use_gpu,
+            reverse: Some(reverse),
+            external_cal: ext_cal,
         };
 
         let (tx, rx): (Sender<ProgressMsg>, Receiver<ProgressMsg>) =
@@ -232,6 +268,54 @@ impl DewarpGui {
         ));
     }
 
+    fn load_calibration_file(&mut self, ctx: &egui::Context) {
+        let file = rfd::FileDialog::new()
+            .add_filter("Calibration files", &["cal", "txt"])
+            .add_filter("All files", &["*"])
+            .set_title("Load Calibration File")
+            .pick_file();
+
+        if let Some(path) = file {
+            match DjiCalibration::load_from_file(&path) {
+                Some(mut cal) => {
+                    cal.dewarp_flag = 0;
+                    self.calibration = Some(cal);
+                    self.cal_from_file = true;
+                    self.needs_cal_file = false;
+                    self.reverse_mode = true;
+                    self.status_msg = format!(
+                        "{} images  |  Calibration loaded from file  |  Mode: REVERSE",
+                        self.image_count
+                    );
+                    let path = std::path::Path::new(&self.input_folder);
+                    let images = pipeline::collect_images(path, self.recursive);
+                    if !images.is_empty() {
+                        self.generate_preview(&images[0], ctx);
+                    }
+                }
+                None => {
+                    self.status_msg = "Failed to parse calibration file.".into();
+                }
+            }
+        }
+    }
+
+    fn export_calibration_file(&self) {
+        let Some(cal) = &self.calibration else { return };
+
+        let file = rfd::FileDialog::new()
+            .add_filter("Calibration files", &["cal"])
+            .set_title("Export Calibration File")
+            .set_file_name("lens_calibration.cal")
+            .save_file();
+
+        if let Some(path) = file {
+            if let Err(e) = cal.save_to_file(&path) {
+                log::error!("Failed to save calibration: {e}");
+            }
+        }
+    }
+
     fn show_about_window(&mut self, ctx: &egui::Context) {
         egui::Window::new("About Camera Dewarp")
             .open(&mut self.show_about)
@@ -283,6 +367,16 @@ impl eframe::App for DewarpGui {
                         self.input_folder = path.to_string_lossy().to_string();
                         self.load_input_folder(&ctx);
                     }
+                    ui.close_menu();
+                }
+                ui.separator();
+                if ui.button("Load Calibration...").clicked() {
+                    self.load_calibration_file(&ctx);
+                    ui.close_menu();
+                }
+                let has_cal = self.calibration.is_some();
+                if ui.add_enabled(has_cal, egui::Button::new("Export Calibration...")).clicked() {
+                    self.export_calibration_file();
                     ui.close_menu();
                 }
                 ui.separator();
@@ -358,7 +452,12 @@ impl eframe::App for DewarpGui {
 
         // Preview area (takes remaining space)
         ui.group(|ui| {
-            ui.label(egui::RichText::new("Preview  (Original | Dewarped)").strong());
+            let preview_label = if self.reverse_mode {
+                "Preview  (Dewarped | Re-distorted)"
+            } else {
+                "Preview  (Original | Dewarped)"
+            };
+            ui.label(egui::RichText::new(preview_label).strong());
             ui.separator();
 
             let avail = ui.available_size();
@@ -389,15 +488,19 @@ impl eframe::App for DewarpGui {
 
         // Lens calibration — collapsible, below preview
         let cal_header = if let Some(cal) = &self.calibration {
+            let source = if self.cal_from_file { "file" } else { "XMP" };
             format!(
-                "Lens Calibration   (fx={:.1}  k1={:.4}  Flag: {})",
+                "Lens Calibration   (fx={:.1}  k1={:.4}  Flag: {}  src: {source})",
                 cal.fx, cal.k1, cal.dewarp_flag
             )
+        } else if self.needs_cal_file {
+            "Lens Calibration  (not found — load file)".to_string()
         } else {
             "Lens Calibration  (no image loaded)".to_string()
         };
+        let cal_open = self.show_calibration || self.needs_cal_file;
         egui::CollapsingHeader::new(egui::RichText::new(cal_header).strong())
-            .default_open(self.show_calibration)
+            .default_open(cal_open)
             .show(ui, |ui| {
                 if let Some(cal) = &self.calibration {
                     ui.horizontal(|ui| {
@@ -412,6 +515,12 @@ impl eframe::App for DewarpGui {
                             cal.k1, cal.k2, cal.k3, cal.p1, cal.p2
                         ));
                     });
+                } else if self.needs_cal_file {
+                    ui.label("No embedded DewarpData. Load a calibration file extracted from a raw capture.");
+                    ui.add_space(4.0);
+                    if ui.button("Load Calibration File...").clicked() {
+                        self.load_calibration_file(&ctx);
+                    }
                 } else {
                     ui.label("Load a folder with DJI images to see calibration data.");
                 }
@@ -444,11 +553,16 @@ impl eframe::App for DewarpGui {
                 && !self.input_folder.is_empty()
                 && self.calibration.is_some()
                 && self.dewarp_enabled;
+            let btn_label = if self.reverse_mode {
+                "  Re-distort Batch  "
+            } else {
+                "  Dewarp Batch  "
+            };
             if ui
                 .add_enabled(
                     btn_enabled,
                     egui::Button::new(
-                        egui::RichText::new("  Dewarp Batch  ").strong().size(16.0),
+                        egui::RichText::new(btn_label).strong().size(16.0),
                     ),
                 )
                 .clicked()

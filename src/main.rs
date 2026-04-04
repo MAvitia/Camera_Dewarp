@@ -40,6 +40,10 @@ struct Cli {
     /// Use GPU for remap
     #[arg(long)]
     gpu: bool,
+
+    /// Path to external calibration file (.cal)
+    #[arg(long)]
+    cal: Option<PathBuf>,
 }
 
 fn main() {
@@ -101,11 +105,23 @@ fn main() {
 
     println!("DJI Dewarp Tool (Rust)\n");
 
+    let external_cal = cli.cal.as_ref().and_then(|p| {
+        let cal = calibration::DjiCalibration::load_from_file(p);
+        if cal.is_none() {
+            eprintln!("Error: failed to parse calibration file {}", p.display());
+            std::process::exit(1);
+        }
+        println!("  Loaded external calibration from {}\n", p.display());
+        cal
+    });
+
     let settings = pipeline::BatchSettings {
         quality: cli.quality,
         alpha: cli.alpha,
         recursive: cli.recursive,
         use_gpu: cli.gpu,
+        reverse: None,
+        external_cal,
     };
 
     let (tx_progress, rx_progress) = crossbeam_channel::unbounded();
@@ -118,6 +134,11 @@ fn main() {
 
     for msg in &rx_progress {
         match msg {
+            pipeline::ProgressMsg::CalibrationLoaded(cal) => {
+                if cal.dewarp_flag != 0 {
+                    println!("  DewarpFlag={} -> REVERSE mode (re-applying barrel distortion)\n", cal.dewarp_flag);
+                }
+            }
             pipeline::ProgressMsg::Processing { current, total, name } => {
                 println!("  [{current}/{total}] {name}");
             }

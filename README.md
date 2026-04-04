@@ -15,6 +15,11 @@
 
 ---
 
+> **Warning — Use at your own risk.**
+> This tool relies on lens calibration data to geometrically transform images. If the calibration parameters are incorrect, missing, or applied to images from a different lens/sensor, the output will be **geometrically inaccurate**. Always verify results against known straight-line references before using dewarped images in photogrammetry, surveying, or measurement workflows. The author assumes no liability for inaccurate outputs.
+
+---
+
 <br>
 
 ## Before & After
@@ -38,6 +43,8 @@
 
 Camera Dewarp reads the **factory lens calibration** embedded in every DJI drone image's XMP metadata (`DewarpData`) and applies geometric undistortion to remove barrel distortion. No manual calibration, no checkerboard patterns — just point it at your mission folder and go.
 
+It also supports **reverse mode**: if images were already dewarped (by DJI on-device processing or a previous run), Camera Dewarp can re-apply barrel distortion to restore the original camera perspective.
+
 <br>
 
 ## Features
@@ -49,12 +56,14 @@ Camera Dewarp reads the **factory lens calibration** embedded in every DJI drone
 - **Zero-config** — calibration is read automatically from each image's XMP metadata
 - **Batch processing** — process entire mission folders with thousands of images
 - **Native GUI** — folder pickers, live before/after preview, progress bar
+- **Metadata preserved** — EXIF, GPS geotags, XMP, and ICC profiles are retained in output
 
 </td>
 <td width="50%">
 
+- **Reverse mode** — re-apply barrel distortion to already-dewarped images
+- **Calibration files** — export/import `.cal` files for images without embedded data
 - **21 images/sec** — parallel processing across all CPU cores via rayon
-- **GPU acceleration** — optional wgpu compute shader for the remap step
 - **Single portable binary** — no Python, no runtime, no installer
 
 </td>
@@ -71,7 +80,18 @@ Download [`camera-dewarp.exe`](https://github.com/MAvitia/Camera_Dewarp/releases
 
 1. Click **Browse** to select your mission image folder
 2. Set an output folder (or leave blank for auto)
-3. Click **Dewarp Batch**
+3. Click **Dewarp Batch** (or **Re-distort Batch** if reverse mode is detected)
+
+#### Exporting & Loading Calibration Files
+
+If your images were dewarped on-device by DJI and no longer contain embedded calibration data:
+
+1. Take a **raw capture** from the same drone with dewarp disabled — this image will contain the factory `DewarpData`
+2. Open the raw image folder in Camera Dewarp
+3. Go to **File → Export Calibration...** and save the `.cal` file
+4. Open the folder with the on-device dewarped images (the tool will warn "no embedded calibration")
+5. Go to **File → Load Calibration...** and select the `.cal` file
+6. The tool switches to **Reverse mode** automatically — click **Re-distort Batch**
 
 ### CLI
 
@@ -85,6 +105,9 @@ camera-dewarp --info -r ./mission_photos
 # Single image
 camera-dewarp photo.jpg -o ./out
 
+# Use an external calibration file (auto-detects reverse mode)
+camera-dewarp ./dewarped_photos -o ./rewarped --cal lens_calibration.cal
+
 # GPU-accelerated
 camera-dewarp -r ./photos -o ./out --gpu
 ```
@@ -95,11 +118,12 @@ camera-dewarp -r ./photos -o ./out --gpu
 
 | Flag | Description |
 |------|-------------|
-| `-o, --output` | Output folder (default: `<input>_dewarped`) |
+| `-o, --output` | Output folder (default: `<input>_dewarped` or `<input>_warped`) |
 | `-q, --quality` | JPEG quality 1–100 (default: 95) |
 | `-r, --recursive` | Process subfolders |
 | `--alpha` | Crop control: `0` = no black edges, `1` = keep all pixels |
 | `--gpu` | Use GPU compute shader for remap |
+| `--cal <file>` | Load external calibration file (`.cal`) |
 | `--info` | Print calibration info and exit |
 | `--gui` | Launch GUI (default if no input given) |
 
@@ -115,6 +139,44 @@ camera-dewarp -r ./photos -o ./out --gpu
 
 4. **Crop Optimization** — equivalent of OpenCV's `getOptimalNewCameraMatrix` finds the maximal valid region, eliminating black borders
 
+5. **Metadata Preservation** — EXIF (GPS, camera info), XMP (DJI flight data), and ICC color profiles are extracted from source images and spliced into outputs; the `DewarpFlag` is updated to reflect the processing state
+
+<br>
+
+## Reverse Mode
+
+Camera Dewarp auto-detects when images have already been dewarped:
+
+| Condition | Mode | Output suffix |
+|-----------|------|---------------|
+| `DewarpFlag = 0` (raw image) | **Dewarp** — removes barrel distortion | `_dewarped` |
+| `DewarpFlag != 0` (already dewarped) | **Reverse** — re-applies barrel distortion | `_warped` |
+| No embedded data + external `.cal` loaded | **Reverse** — assumes on-device dewarped | `_warped` |
+
+The `DewarpFlag` in the output metadata is updated accordingly (`0` → `1` after dewarp, `1` → `0` after reverse), enabling clean round-trip processing.
+
+<br>
+
+## Calibration File Format
+
+The `.cal` file is a plain-text key-value format:
+
+```
+# Camera Dewarp — Lens Calibration File
+calibration_date=2025-10-29
+fx=3707.311686000000
+fy=3707.311686000000
+cx=2660.730558000000
+cy=1943.102160000000
+k1=-0.107120805743000
+k2=-0.001098361050000
+k3=-0.014380999076000
+p1=0.000310881741000
+p2=-0.000553323386000
+```
+
+> **Warning:** Only use calibration files extracted from the **same drone and lens** as the target images. Applying calibration from a different device will produce geometrically inaccurate results. Calibration parameters are unique to each camera/lens assembly.
+
 <br>
 
 ## Supported Cameras
@@ -129,7 +191,7 @@ Any DJI drone that embeds `DewarpData` in XMP metadata:
 | Matrice | M300 RTK, M350 RTK (with Zenmuse cameras) |
 | Phantom | Phantom 4 RTK, Phantom 4 Pro V2 |
 
-Images must have `DewarpFlag: 0` (not already dewarped by DJI's on-device processing).
+For forward dewarp, images must have `DewarpFlag: 0`. For reverse mode, images can have any `DewarpFlag` value or use an external calibration file.
 
 <br>
 
@@ -163,11 +225,11 @@ Binary output: `target/release/camera-dewarp.exe`
 ```
 src/
   main.rs          — CLI (clap) + GUI launcher
-  calibration.rs   — XMP byte scan, DewarpData parsing
-  remap.rs         — Undistort LUT, bilinear remap with rayon
+  calibration.rs   — XMP byte scan, DewarpData parsing, .cal file I/O
+  remap.rs         — Undistort/redistort LUT, bilinear remap with rayon
   gpu.rs           — wgpu compute shader pipeline
   pipeline.rs      — Batch processor, parallel workers, progress channel
-  gui.rs           — egui application
+  gui.rs           — egui application with calibration import/export
 shaders/
   remap.wgsl       — GPU remap compute shader (WGSL)
 samples/
